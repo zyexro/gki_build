@@ -1,0 +1,193 @@
+name: Build GKI Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repository:
+        description: Kernel source repository (owner/name)
+        required: false
+        default: zyexro/android_kernel_xiaomi_mt6886
+      kernel_ref:
+        description: Kernel branch, tag or commit
+        required: false
+        default: lineage-22.1
+      defconfig:
+        description: Base defconfig
+        required: false
+        default: gki_defconfig
+      fragments:
+        description: Space separated config fragments merged on top of the base defconfig
+        required: false
+        default: arch/arm64/configs/mgk_64_k515_defconfig arch/arm64/configs/vendor/xiaomi_mgk.config arch/arm64/configs/vendor/lineage_mgk.config arch/arm64/configs/vendor/zircon.config
+      targets:
+        description: Make targets to build
+        required: false
+        default: Image.lz4 Image.gz modules
+      lto:
+        description: LTO mode (none, thin or full)
+        required: false
+        default: thin
+      apply_patches:
+        description: Apply patches/*.patch to the kernel source (1 or 0)
+        required: false
+        default: '1'
+      clang_version:
+        description: AOSP clang version
+        required: false
+        default: clang-r450784e
+      clang_branch:
+        description: Prebuilt clang branch on android.googlesource.com
+        required: false
+        default: android14-release
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ github.event.inputs.kernel_ref || 'lineage-22.1' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      KERNEL_REPOSITORY: ${{ github.event.inputs.kernel_repository || 'zyexro/android_kernel_xiaomi_mt6886' }}
+      KERNEL_REF: ${{ github.event.inputs.kernel_ref || 'lineage-22.1' }}
+      DEFCONFIG: ${{ github.event.inputs.defconfig || 'gki_defconfig' }}
+      FRAGMENTS: ${{ github.event.inputs.fragments || 'arch/arm64/configs/mgk_64_k515_defconfig arch/arm64/configs/vendor/xiaomi_mgk.config arch/arm64/configs/vendor/lineage_mgk.config arch/arm64/configs/vendor/zircon.config' }}
+      TARGETS: ${{ github.event.inputs.targets || 'Image.lz4 Image.gz modules' }}
+      LTO: ${{ github.event.inputs.lto || 'thin' }}
+      APPLY_PATCHES: ${{ github.event.inputs.apply_patches || '1' }}
+      CLANG_VERSION: ${{ github.event.inputs.clang_version || 'clang-r450784e' }}
+      CLANG_BRANCH: ${{ github.event.inputs.clang_branch || 'android14-release' }}
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+      OUT_DIR: ${{ github.workspace }}/kernel/out
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - name: Enable swap for LTO linking
+        run: |
+          if sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192; then
+            sudo chmod 600 /swapfile
+            if sudo mkswap /swapfile && sudo swapon /swapfile; then
+              echo "swap enabled"
+            else
+              echo "swap could not be enabled, continuing without it"
+            fi
+          else
+            echo "could not create swap file, continuing without it"
+          fi
+          free -h
+
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.kernel_repository || 'zyexro/android_kernel_xiaomi_mt6886' }}
+          ref: ${{ github.event.inputs.kernel_ref || 'lineage-22.1' }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            zip unzip lz4 cpio rsync kmod device-tree-compiler \
+            gcc-aarch64-linux-gnu build-essential python3 curl dwarves
+          pahole --version
+
+      - name: Download AOSP clang
+        run: |
+          mkdir -p "$HOME/toolchains/clang"
+          curl -sSLo "$RUNNER_TEMP/clang.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${CLANG_BRANCH}/${CLANG_VERSION}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$HOME/toolchains/clang"
+          "$HOME/toolchains/clang/bin/clang" --version
+          echo "CLANG_DIR=$HOME/toolchains/clang" >> "$GITHUB_ENV"
+
+      - name: Configure and build kernel
+        env:
+          CROSS_COMPILE: aarch64-linux-gnu-
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLANG_DIR/lib:$CLANG_DIR/lib64:${LD_LIBRARY_PATH:-}"
+          bash scripts/build_kernel.sh
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          KVER="$(cat "$OUT_DIR/include/config/kernel.release" 2>/dev/null || echo unknown)"
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+          cp "$OUT_DIR/arch/arm64/boot/Image.gz"  artifacts/Image.gz
+          cp "$OUT_DIR/arch/arm64/boot/Image.lz4" artifacts/Image.lz4
+          cp "$OUT_DIR/vmlinux"                   artifacts/vmlinux
+          cp "$OUT_DIR/System.map"                artifacts/System.map
+          cp "$OUT_DIR/.config"                   "artifacts/config-${KVER}"
+          # Upstream EVB dtbs only. The zircon device dtbs are built by the
+          # Android build system from the vendor DTS overlay, not by this tree.
+          if find "$OUT_DIR/arch/arm64/boot/dts" -name '*.dtb' -print -quit 2>/dev/null | grep -q .; then
+            find "$OUT_DIR/arch/arm64/boot/dts" -name '*.dtb' -print0 \
+              | tar --null -czf "artifacts/dtbs-upstream-${KVER}.tar.gz" -T -
+          fi
+          if [ -d "$OUT_DIR/modules" ]; then
+            tar -czf "artifacts/modules-${KVER}.tar.gz" -C "$OUT_DIR/modules" .
+          fi
+          ls -la artifacts
+
+      - name: Create AnyKernel3 flashable zip
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          cp "$OUT_DIR/arch/arm64/boot/Image.gz" anykernel/Image.gz
+          sed -i \
+            -e 's/^kernel.string=.*/kernel.string=GKI Kernel for Xiaomi MT6886 (zircon)/' \
+            -e 's/^do.devicecheck=.*/do.devicecheck=1/' \
+            -e 's/^do.modules=.*/do.modules=0/' \
+            -e 's/^do.systemless=.*/do.systemless=0/' \
+            -e 's/^device.name1=.*/device.name1=zircon/' \
+            -e 's/^device.name2=.*/device.name2=/' \
+            -e 's/^device.name3=.*/device.name3=/' \
+            -e 's/^device.name4=.*/device.name4=/' \
+            -e 's/^device.name5=.*/device.name5=/' \
+            -e 's#^BLOCK=.*#BLOCK=/dev/block/by-name/boot;#' \
+            -e 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/' \
+            anykernel/anykernel.sh
+          ( cd anykernel && zip -r9 "$GITHUB_WORKSPACE/artifacts/AnyKernel3-zircon-${KVER}.zip" . -x '.git*' )
+
+      - name: Generate checksums
+        run: |
+          find artifacts -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > artifacts/SHA256SUMS
+          cat artifacts/SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kernel-${{ github.run_number }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
